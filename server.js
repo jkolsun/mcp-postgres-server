@@ -2,9 +2,26 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
+import pg from 'pg';
+import { z } from 'zod';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 const app = express();
 app.use(cors());
+
+// Streamable HTTP carries its session id in a header, so it has to be both
+// allowed on the way in and exposed on the way out — cors() alone does not
+// expose custom response headers. Modelled on bright-engine-mcp, which is the
+// server in this project that already connects cleanly.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, mcp-session-id');
+  res.header('Access-Control-Expose-Headers', 'mcp-session-id');
+  if (req.method === 'OPTIONS') { res.sendStatus(204); return; }
+  next();
+});
 
 // ── SPEC_McpPostgresProbe (2026-09-17) — connector handshake responses ──────
 //
@@ -57,6 +74,102 @@ const sessions = new Map();
 app.get('/healthz', (req, res) => {
   res.send('ok');
 });
+
+// ── Streamable HTTP on /mcp (2026-09-17) ───────────────────────────────────
+//
+// The real fix behind SPEC_McpPostgresProbe's 405: SSE is deprecated in
+// Claude's Add-connector dialog. Modelled on bright-engine-mcp — the server in
+// this same Railway project that already connects cleanly — so the shape here
+// is deliberately identical: stateless transport, a fresh McpServer per
+// request, 405 on GET/DELETE.
+//
+// The single `query` tool keeps the name, description and input schema the
+// stdio child exposed (@modelcontextprotocol/server-postgres), so nothing that
+// already calls this connector has to change.
+//
+// One pool for the process, rather than the child's one-connection-per-session:
+// /mcp is stateless, so a pool is what keeps a burst of tool calls from opening
+// a connection each.
+const pool = new pg.Pool({ connectionString: DATABASE_URL });
+
+pool.on('error', (err) => {
+  // An idle client erroring out must not take the process down.
+  console.error('[pg] idle client error:', err.message);
+});
+
+/**
+ * Read-only by construction, not by inspection.
+ *
+ * The upstream stdio server ran every statement inside `BEGIN TRANSACTION
+ * READ ONLY` and rolled it back, and that is reproduced exactly here. It
+ * matters: Postgres itself refuses writes in such a transaction, so this holds
+ * for anything the caller sends — including statements a regex blocklist would
+ * miss (a write hidden in a CTE, a function call with side effects, DDL). The
+ * ROLLBACK is in a finally so a failed query cannot leave the connection
+ * inside an open transaction when it returns to the pool.
+ */
+async function runReadOnlyQuery(sql) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN TRANSACTION READ ONLY');
+    const result = await client.query(sql);
+    return result.rows;
+  } finally {
+    try {
+      await client.query('ROLLBACK');
+    } catch (err) {
+      console.error('[pg] rollback failed:', err.message);
+    }
+    client.release();
+  }
+}
+
+function createMcpServer() {
+  const server = new McpServer({ name: 'mcp-postgres', version: '1.0.0' });
+
+  server.tool(
+    'query',
+    'Run a read-only SQL query',
+    { sql: z.string().describe('The SQL query to run. Executed inside a READ ONLY transaction.') },
+    async ({ sql }) => {
+      try {
+        const rows = await runReadOnlyQuery(sql);
+        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      }
+    },
+  );
+
+  return server;
+}
+
+app.post('/mcp', async (req, res) => {
+  try {
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on('close', () => {
+      transport.close().catch(() => {});
+      server.close().catch(() => {});
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP POST error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+});
+
+// Stateless: there is no stream to resume and no session to delete.
+app.get('/mcp', (req, res) => {
+  res.status(405).json({ error: 'Method not allowed in stateless mode' });
+});
+app.delete('/mcp', (req, res) => {
+  res.status(405).json({ error: 'Method not allowed in stateless mode' });
+});
+// ───────────────────────────────────────────────────────────────────────────
 
 app.get('/sse', (req, res) => {
   const sessionId = crypto.randomUUID();

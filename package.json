@@ -9,6 +9,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "pg": "^8.13.0",
     "express": "^4.21.0",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "zod": "^3.24.0"
   }
 }
