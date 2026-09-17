@@ -5,6 +5,43 @@ import { spawn } from 'child_process';
 
 const app = express();
 app.use(cors());
+
+// ── SPEC_McpPostgresProbe (2026-09-17) — connector handshake responses ──────
+//
+// These three sit ABOVE express.json() deliberately: the 405 must answer any
+// POST to /sse, including one whose body fails to parse. Behind the body
+// parser, a malformed payload would be answered with a 400 by express.json()
+// before ever reaching this handler, and 400 is just as unclassifiable to the
+// client as the 404 was.
+//
+// 1. Claude.ai's Add-connector flow first POSTs `initialize` to the connector
+//    URL to detect a no-auth streamable-HTTP server. This wrapper is SSE-only,
+//    so it had no POST /sse route at all and Express answered its default 404.
+//    A 404 is unclassifiable: the client cannot tell "wrong URL" from "not
+//    streamable HTTP", so it fell through to OAuth discovery, found none, and
+//    failed with "Couldn't register with MCP_POSTGRES's sign-in service."
+//    405 + Allow: GET is the documented signal for "SSE server, no auth, use
+//    GET" — it is what makes the probe succeed rather than a cosmetic status.
+//    No child is spawned and no SSE connection is logged: this is a probe, not
+//    a session, and treating it as one would leak a server-postgres process
+//    per connector check.
+app.post('/sse', (req, res) => {
+  res.status(405).set({ 'Allow': 'GET', 'Content-Type': 'text/plain' }).send('SSE endpoint: use GET');
+});
+
+// 2. Belt: OAuth discovery must get a clean "no OAuth here" rather than
+//    whatever a proxy might synthesise later.
+app.all('/.well-known/*', (req, res) => {
+  res.status(404).end();
+});
+
+// 3. A plain root health page, so the domain root is never a 404 for anyone
+//    who opens it in a browser.
+app.get('/', (req, res) => {
+  res.status(200).type('text/plain').send('mcp-postgres ok');
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
