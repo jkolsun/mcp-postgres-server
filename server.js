@@ -6,9 +6,16 @@ import pg from 'pg';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createAuth, clientIp } from './auth.js';
 
 const app = express();
 app.use(cors());
+
+// 2026-10-30 — every MCP route lives on this router, which is mounted only
+// behind the secret (auth.js): at /k/<MCP_API_KEY>/… and, for a client that
+// sends Authorization: Bearer, at the bare paths. Only the static health
+// pages below stay on the open app.
+const mcp = express.Router();
 
 // Streamable HTTP carries its session id in a header, so it has to be both
 // allowed on the way in and exposed on the way out — cors() alone does not
@@ -42,7 +49,7 @@ app.use((req, res, next) => {
 //    No child is spawned and no SSE connection is logged: this is a probe, not
 //    a session, and treating it as one would leak a server-postgres process
 //    per connector check.
-app.post('/sse', (req, res) => {
+mcp.post('/sse', (req, res) => {
   res.status(405).set({ 'Allow': 'GET', 'Content-Type': 'text/plain' }).send('SSE endpoint: use GET');
 });
 
@@ -59,7 +66,7 @@ app.get('/', (req, res) => {
 });
 // ───────────────────────────────────────────────────────────────────────────
 
-app.use(express.json());
+mcp.use(express.json());
 
 const PORT = process.env.PORT || 8080;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -144,8 +151,11 @@ function createMcpServer() {
   return server;
 }
 
-app.post('/mcp', async (req, res) => {
+mcp.post('/mcp', async (req, res) => {
   try {
+    // Audit line (no SQL, no secret): who called what.
+    const b = req.body || {};
+    console.log(`[mcp] ${b.method || '?'}${b.params?.name ? ` ${b.params.name}` : ''} from ${clientIp(req)}`);
     const server = createMcpServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {
@@ -163,17 +173,17 @@ app.post('/mcp', async (req, res) => {
 });
 
 // Stateless: there is no stream to resume and no session to delete.
-app.get('/mcp', (req, res) => {
+mcp.get('/mcp', (req, res) => {
   res.status(405).json({ error: 'Method not allowed in stateless mode' });
 });
-app.delete('/mcp', (req, res) => {
+mcp.delete('/mcp', (req, res) => {
   res.status(405).json({ error: 'Method not allowed in stateless mode' });
 });
 // ───────────────────────────────────────────────────────────────────────────
 
-app.get('/sse', (req, res) => {
+mcp.get('/sse', (req, res) => {
   const sessionId = crypto.randomUUID();
-  console.log(`[${sessionId}] New SSE connection`);
+  console.log(`[${sessionId}] New SSE connection from ${clientIp(req)}`);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -210,7 +220,8 @@ app.get('/sse', (req, res) => {
 
   sessions.set(sessionId, { child, res });
 
-  res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
+  // baseUrl keeps the client on the same authenticated prefix (/k/<key> or '').
+  res.write(`event: endpoint\ndata: ${req.baseUrl}/message?sessionId=${sessionId}\n\n`);
 
   const keepalive = setInterval(() => {
     try { res.write(': keepalive\n\n'); } catch (e) { clearInterval(keepalive); }
@@ -224,7 +235,7 @@ app.get('/sse', (req, res) => {
   });
 });
 
-app.post('/message', (req, res) => {
+mcp.post('/message', (req, res) => {
   const sessionId = req.query.sessionId;
   if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
 
@@ -236,6 +247,13 @@ app.post('/message', (req, res) => {
   session.child.stdin.write(message + '\n');
   res.status(202).json({ status: 'accepted' });
 });
+
+const auth = createAuth();
+if (!auth.configured) {
+  console.error('[auth] MCP_API_KEY is not set (or shorter than 32 characters) — every MCP route answers 503 until it is (fail closed)');
+}
+app.use('/k/:key', auth.pathKey, mcp);
+app.use(auth.bearer, mcp);
 
 app.listen(PORT, () => {
   console.log(`MCP Postgres SSE server listening on port ${PORT}`);
